@@ -1,0 +1,29 @@
+/* TurboSkip settings panel styling */
+
+#turbo_skip_settings .inline-drawer-content {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px;
+}
+
+#turbo_skip_settings .turbo_skip_row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#turbo_skip_settings .turbo_skip_row label {
+    white-space: nowrap;
+    margin: 0;
+}
+
+#turbo_skip_settings textarea {
+    width: 100%;
+    min-height: 60px;
+    resize: vertical;
+}
+
+#turbo_skip_settings input[type="number"] {
+    width: 70px;
+}
