@@ -173,15 +173,21 @@ function waitForGenerationSettled(maxMs = 30000) {
  *                            or a pipeline tail has not yet nulled it.
  *
  * Requires sustained quiet (quietMs): a follow-up generation announces
- * itself via GENERATION_STARTED within its first microtasks, but
- * dataset.generating / streamingProcessor only flip later in its pipeline —
- * a single instant "all clear" sample can land exactly in that gap.
+ * itself via GENERATION_STARTED at the very top of Generate() — awaited,
+ * so synchronous follow-ups (auto-continue's click) trip generationActive
+ * before our own dispatch even resolves. Only timer-based starts (group
+ * auto-mode) need the window; keep it short.
+ *
+ * Note: remaining inter-regen delay beyond this window is ST itself
+ * generating a follow-up (auto-continue / auto-swipe / group chain) —
+ * it is load-bearing and cannot be skipped without re-arming the
+ * streamingProcessor race.
  *
  * @param {number} maxMs total safety cap in ms
  * @param {number} quietMs required consecutive quiet ms before dispatching
  * @returns {Promise<void>}
  */
-async function waitForPipelineIdle(maxMs = 30000, quietMs = 2000) {
+async function waitForPipelineIdle(maxMs = 30000, quietMs = 500) {
     await waitForGenerationSettled(maxMs);
 
     const ctx = getContext();
