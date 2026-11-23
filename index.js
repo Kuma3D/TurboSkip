@@ -155,27 +155,55 @@ function waitForGenerationSettled(maxMs = 30000) {
  * Wait until SillyTavern's ENTIRE generation pipeline is idle — not just the
  * generation TurboSkip dispatched, but any follow-up generation ST itself
  * starts: auto-continue (triggerAutoContinue fires a 'continue' Generate
- * synchronously inside our own pipeline's onSuccess), group-chat auto-mode
- * member chains, etc. Those run concurrently with / after our awaited
- * Generate resolves, and streamingProcessor is a shared module global — a
- * regen dispatched while a follow-up is mid-stream races that global
- * (one pipeline nulls it, the other calls .generate() on null → TypeError,
- * and the message the follow-up was writing gets spliced out).
+ * synchronously inside our own pipeline's tail), group-chat auto-mode member
+ * chains on timers, etc. Those run concurrently after our awaited Generate
+ * resolves, and streamingProcessor is a shared module global — a regen
+ * dispatched while a follow-up is active races that global (one pipeline
+ * nulls it, the other calls .generate() on null → TypeError, and the
+ * message gets spliced out).
  *
- * Signal: document.body.dataset.generating — set by deactivateSendButtons()
- * at generation start, cleared by activateSendButtons() at generation end —
- * readable without script.js exports and true across the whole chain.
+ * Three busy signals, any one of which means NOT idle:
+ *  - generationActive      — GENERATION_STARTED fired, no STOPPED/ENDED yet
+ *                            (fires at the very top of Generate, before
+ *                            prompt building: catches follow-ups earliest)
+ *  - document.body.dataset.generating — set by deactivateSendButtons(),
+ *                            cleared by activateSendButtons()
+ *  - ctx.streamingProcessor !== null — the module global itself, read live
+ *                            via getContext(); non-null while a stream runs
+ *                            or a pipeline tail has not yet nulled it.
  *
- * @param {number} maxMs safety cap in ms
+ * Requires sustained quiet (quietMs): a follow-up generation announces
+ * itself via GENERATION_STARTED within its first microtasks, but
+ * dataset.generating / streamingProcessor only flip later in its pipeline —
+ * a single instant "all clear" sample can land exactly in that gap.
+ *
+ * @param {number} maxMs total safety cap in ms
+ * @param {number} quietMs required consecutive quiet ms before dispatching
  * @returns {Promise<void>}
  */
-async function waitForPipelineIdle(maxMs = 30000) {
+async function waitForPipelineIdle(maxMs = 30000, quietMs = 2000) {
     await waitForGenerationSettled(maxMs);
-    let waited = 0;
-    while (document.body.dataset.generating && waited < maxMs) {
+
+    const ctx = getContext();
+    const isBusy = () => generationActive
+        || !!document.body.dataset.generating
+        || ctx.streamingProcessor != null;
+
+    const start = Date.now();
+    let quietStart = null;
+    while (Date.now() - start < maxMs) {
+        if (isBusy()) {
+            quietStart = null;
+        } else {
+            if (quietStart === null) quietStart = Date.now();
+            if (Date.now() - quietStart >= quietMs) {
+                tsDebug('pipeline idle (sustained quiet), ready to dispatch');
+                return;
+            }
+        }
         await sleep(100);
-        waited += 100;
     }
+    tsDebug(`waitForPipelineIdle hit ${maxMs}ms cap — proceeding anyway`);
 }
 
 /**
