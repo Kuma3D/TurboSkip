@@ -1,9 +1,14 @@
 /**
  * TurboSkip — auto-regenerates AI messages until they contain the phrases you require.
  *
- * After each AI message renders, checks the message text against a configurable
- * list of required phrases. If the requirement isn't met, triggers a
- * regeneration (/regen await=true) and re-checks — up to a max attempt count.
+ * When an AI message renders, its text is checked against a configurable list
+ * of required phrases. If the requirement isn't met, TurboSkip dispatches
+ * /regen (plain — no named args, for compatibility with all ST builds) and
+ * re-checks when the regenerated message renders, up to a max attempt count.
+ *
+ * The retry loop is event-driven: there is no reliance on the slash command
+ * promise resolving after generation completes (which requires an `await=true`
+ * named argument not present in all ST versions).
  */
 
 const MODULE_NAME = 'turboSkip';
@@ -18,25 +23,24 @@ const DEFAULT_SETTINGS = {
     caseSensitive: false,
     // Cap so a never-satisfiable requirement can't regenerate forever.
     maxAttempts: 3,
-    // Small pause (ms) after a regen finishes before checking the new text.
-    checkDelay: 100,
     // Show a toast when a message is regenerated.
     notifyOnSkip: true,
 };
 
 // ── State ────────────────────────────────────────────────────
 
-let busy = false; // true while our own regen loop is driving generation
+let awaitingSkip = false;   // a /regen we dispatched hasn't rendered its message yet
+let attempts = 0;           // regens dispatched for the current message
+let suppressRender = false; // ignore render events right after a chat switch
 
 function getContext() {
     return SillyTavern.getContext();
 }
 
 function getSettings() {
-    const { extensionSettings, saveSettingsDebounced } = getContext();
+    const { extensionSettings } = getContext();
     if (!extensionSettings[MODULE_NAME]) {
         extensionSettings[MODULE_NAME] = structuredClone(DEFAULT_SETTINGS);
-        saveSettingsDebounced();
     }
     const s = extensionSettings[MODULE_NAME];
     // backfill any keys added in later versions
@@ -44,6 +48,11 @@ function getSettings() {
         if (s[key] === undefined) s[key] = structuredClone(DEFAULT_SETTINGS[key]);
     }
     return s;
+}
+
+function resetSkipState() {
+    awaitingSkip = false;
+    attempts = 0;
 }
 
 function tsDebug(...args) {
@@ -101,75 +110,86 @@ function getLastMessageText() {
     return String(last.mes || '');
 }
 
-// ── Regen loop ────────────────────────────────────────────────
-
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// ── Regen dispatch ─────────────────────────────────────────────
 
 /**
- * Execute /regen await=true through the public slash-command API.
+ * Dispatch a plain /regen slash command (no named arguments — `await=true`
+ * is not supported on all ST builds, and the retry loop doesn't need it:
+ * the next CHARACTER_MESSAGE_RENDERED event is our completion signal).
+ * Fire-and-forget from the caller's perspective.
  */
-async function executeRegen() {
+async function dispatchRegen() {
     const ctx = getContext();
-    if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
-        await ctx.executeSlashCommandsWithOptions('/regen await=true');
-    } else if (typeof ctx.executeSlashCommands === 'function') {
-        // older ST builds
-        await ctx.executeSlashCommands('/regen await=true');
-    } else {
-        console.warn('[TurboSkip] no slash-command executor available in context');
-    }
-}
-
-/**
- * The skip loop: while the latest AI message fails the phrase check and
- * attempts remain, regenerate it. Guards against user messages arriving
- * mid-loop (re-checks that the last message is still the one being skipped).
- */
-async function skipLoop() {
-    const settings = getSettings();
-    let attempt = 0;
-
-    while (attempt < settings.maxAttempts) {
-        await sleep(settings.checkDelay);
-
-        const text = getLastMessageText();
-        if (text === null) return; // last message is no longer an AI message — abort
-        if (passesCheck(text)) return; // requirement met — done
-
-        attempt++;
-        tsDebug(`phrase check failed, regenerating (attempt ${attempt}/${settings.maxAttempts})`);
-
-        if (settings.notifyOnSkip) {
-            toastr.info(`TurboSkip: regenerating message — missing required phrase (${attempt}/${settings.maxAttempts})`, '', { timeOut: 2500 });
+    try {
+        if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
+            await ctx.executeSlashCommandsWithOptions('/regen');
+        } else if (typeof ctx.executeSlashCommands === 'function') {
+            await ctx.executeSlashCommands('/regen'); // older ST builds
+        } else {
+            console.warn('[TurboSkip] no slash-command executor available in context');
+            toastr.error('TurboSkip: this SillyTavern build exposes no slash-command API — cannot regenerate.', '', { timeOut: 6000 });
+            resetSkipState();
         }
-
-        busy = true;
-        try {
-            await executeRegen();
-        } catch (err) {
-            console.error('[TurboSkip] regen failed:', err);
-            return;
-        } finally {
-            busy = false;
-        }
-    }
-
-    // All attempts used — give the final verdict
-    await sleep(settings.checkDelay);
-    const text = getLastMessageText();
-    if (text !== null && !passesCheck(text)) {
-        toastr.warning(`TurboSkip: gave up after ${settings.maxAttempts} regenerations — phrase requirement not met.`, '', { timeOut: 5000 });
-        tsDebug('gave up; message still does not satisfy phrase requirement');
+    } catch (err) {
+        console.error('[TurboSkip] /regen failed:', err);
+        toastr.error('TurboSkip: /regen failed — see console (F12) for details.', '', { timeOut: 6000 });
+        resetSkipState();
     }
 }
 
 // ── Event wiring ──────────────────────────────────────────────
 
 function onCharacterMessageRendered() {
+    if (suppressRender) return;
+
+    // A render while a regen we dispatched is pending is that regen's result.
+    if (awaitingSkip) {
+        awaitingSkip = false;
+    }
+
     const settings = getSettings();
     if (!settings.enabled) return;
-    if (busy) return; // our own regen's render event — the loop already drives it
-    void skipLoop();
+    if (getPhraseList().length === 0) return;
+
+    const text = getLastMessageText();
+    if (text === null) return;      // last message isn't an AI message
+    if (passesCheck(text)) {
+        attempts = 0;                // requirement met — reset for next message
+        return;
+    }
+
+    if (attempts >= settings.maxAttempts) {
+        if (settings.notifyOnSkip) {
+            toastr.warning(`TurboSkip: gave up after ${settings.maxAttempts} regenerations — phrase requirement not met.`, '', { timeOut: 5000 });
+        }
+        tsDebug('gave up; message still does not satisfy phrase requirement');
+        resetSkipState();
+        return;
+    }
+
+    attempts++;
+    tsDebug(`phrase check failed, dispatching /regen (attempt ${attempts}/${settings.maxAttempts})`);
+
+    if (settings.notifyOnSkip) {
+        toastr.info(`TurboSkip: message missing required phrase — regenerating (${attempts}/${settings.maxAttempts})`, '', { timeOut: 2500 });
+    }
+
+    awaitingSkip = true;
+    void dispatchRegen();
+}
+
+function onUserMessageRendered() {
+    // A new user message starts a fresh exchange — reset per-message state.
+    resetSkipState();
+    suppressRender = false;
+}
+
+function onChatChanged() {
+    resetSkipState();
+    // Ignore render events fired while a saved chat is being printed, so we
+    // don't "fix" the last saved message the moment a chat loads.
+    suppressRender = true;
+    setTimeout(() => { suppressRender = false; }, 1000);
 }
 
 // ── Settings UI ───────────────────────────────────────────────
@@ -272,6 +292,8 @@ async function init() {
 
     const { eventSource, eventTypes } = getContext();
     eventSource.on(eventTypes.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
+    eventSource.on(eventTypes.USER_MESSAGE_RENDERED, onUserMessageRendered);
+    eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
 
     initSettingsPanel();
     tsDebug('initialized');
