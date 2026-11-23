@@ -190,10 +190,16 @@ function waitForGenerationSettled(maxMs = 30000) {
 async function waitForPipelineIdle(maxMs = 30000, quietMs = 500) {
     await waitForGenerationSettled(maxMs);
 
-    const ctx = getContext();
-    const isBusy = () => generationActive
-        || !!document.body.dataset.generating
-        || ctx.streamingProcessor != null;
+    // NB: getContext() copies streamingProcessor's CURRENT value into the
+    // returned object — it is a snapshot, not a live binding. Must call
+    // getContext() on EVERY poll, or a mid-pipeline sample sticks truthy
+    // forever and the wait burns to its cap.
+    const isBusy = () => {
+        const ctx = getContext();
+        return generationActive
+            || !!document.body.dataset.generating
+            || ctx.streamingProcessor != null;
+    };
 
     const start = Date.now();
     let quietStart = null;
