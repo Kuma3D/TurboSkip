@@ -113,54 +113,35 @@ function getLastMessageText() {
 // ── Regen dispatch ─────────────────────────────────────────────
 
 /**
- * Dispatch a regeneration. Tries the /regen slash command in both textual
- * forms (with and without the leading slash — builds differ in whether the
- * executor adds its own slash, and a doubled slash makes the parser read the
- * command name as "/regen" → "Unknown command"), suppressing parser-error
- * toasts so a rejected form is invisible. Falls back to triggering the same
- * button handler the chat options menu's Regenerate option uses.
+ * Dispatch a regeneration by calling Generate('regenerate') directly — the
+ * exact function the /regen slash command and the chat menu's Regenerate
+ * option both invoke under the hood. Calling it directly bypasses the slash
+ * parser entirely (no command-name/leading-slash quirks, no parser-error
+ * toasts) and skips the /regen wrapper's generation-lock queueing, so the
+ * regen starts immediately.
  *
- * No `await=true` named argument: not supported on all builds, and the retry
- * loop doesn't need it — the next CHARACTER_MESSAGE_RENDERED event is the
- * completion signal.
+ * ctx.generate maps to Generate in st-context.js. Falls back to the menu
+ * button if a build somehow doesn't expose it.
  *
  * @returns {Promise<boolean>} true if a regeneration was dispatched.
  */
 async function dispatchRegen() {
     const ctx = getContext();
 
-    /** Parser errors are recognized so a rejected form moves on silently;
-     *  other errors mean a generation WAS attempted and failed its way out. */
-    const looksLikeParseError = err =>
-        /position|column|unknown command|unexpected/i.test(String(err?.message ?? err));
-
-    const executors = [];
-    if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
-        executors.push(text => ctx.executeSlashCommandsWithOptions(text, { handleParserErrors: false }));
-    }
-    if (typeof ctx.executeSlashCommands === 'function') {
-        // deprecated form: (text, handleParserErrors, scope, handleExecutionErrors)
-        executors.push(text => ctx.executeSlashCommands(text, false));
-    }
-
-    for (const exec of executors) {
-        for (const text of ['regen', '/regen']) {
-            try {
-                await exec(text);
-                return true;
-            } catch (err) {
-                if (!looksLikeParseError(err)) {
-                    // command found but execution threw — treat as dispatched
-                    console.error('[TurboSkip] /regen execution error:', err);
-                    return true;
-                }
-                tsDebug(`slash form "${text}" rejected, trying next form`);
-            }
+    if (typeof ctx.generate === 'function') {
+        tsDebug('dispatching Generate("regenerate") directly');
+        try {
+            // Fire-and-forget from the loop's perspective: Generate resolves
+            // when the whole generation pipeline finishes, and the rendered
+            // message event is our real completion signal.
+            ctx.generate('regenerate');
+            return true;
+        } catch (err) {
+            console.error('[TurboSkip] Generate("regenerate") threw synchronously:', err);
         }
     }
 
-    // Last resort: the Regenerate button's own click handler — same code path
-    // as pressing the option in the chat menu, works on every ST build.
+    // Fallback: the chat options menu's Regenerate option handler.
     const $regen = $('#option_regenerate');
     if ($regen.length) {
         tsDebug('falling back to #option_regenerate trigger');
@@ -168,7 +149,7 @@ async function dispatchRegen() {
         return true;
     }
 
-    console.warn('[TurboSkip] no slash-command executor or regenerate button available');
+    console.warn('[TurboSkip] no Generate function or regenerate button available in context');
     toastr.error('TurboSkip: could not trigger a regeneration on this SillyTavern build — see console (F12).', '', { timeOut: 6000 });
     return false;
 }
