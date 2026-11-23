@@ -113,33 +113,69 @@ function getLastMessageText() {
 // ── Regen dispatch ─────────────────────────────────────────────
 
 /**
- * Dispatch a plain /regen slash command (no named arguments — `await=true`
- * is not supported on all ST builds, and the retry loop doesn't need it:
- * the next CHARACTER_MESSAGE_RENDERED event is our completion signal).
- * Fire-and-forget from the caller's perspective.
+ * Dispatch a regeneration. Tries the /regen slash command in both textual
+ * forms (with and without the leading slash — builds differ in whether the
+ * executor adds its own slash, and a doubled slash makes the parser read the
+ * command name as "/regen" → "Unknown command"), suppressing parser-error
+ * toasts so a rejected form is invisible. Falls back to triggering the same
+ * button handler the chat options menu's Regenerate option uses.
+ *
+ * No `await=true` named argument: not supported on all builds, and the retry
+ * loop doesn't need it — the next CHARACTER_MESSAGE_RENDERED event is the
+ * completion signal.
+ *
+ * @returns {Promise<boolean>} true if a regeneration was dispatched.
  */
 async function dispatchRegen() {
     const ctx = getContext();
-    try {
-        if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
-            await ctx.executeSlashCommandsWithOptions('/regen');
-        } else if (typeof ctx.executeSlashCommands === 'function') {
-            await ctx.executeSlashCommands('/regen'); // older ST builds
-        } else {
-            console.warn('[TurboSkip] no slash-command executor available in context');
-            toastr.error('TurboSkip: this SillyTavern build exposes no slash-command API — cannot regenerate.', '', { timeOut: 6000 });
-            resetSkipState();
-        }
-    } catch (err) {
-        console.error('[TurboSkip] /regen failed:', err);
-        toastr.error('TurboSkip: /regen failed — see console (F12) for details.', '', { timeOut: 6000 });
-        resetSkipState();
+
+    /** Parser errors are recognized so a rejected form moves on silently;
+     *  other errors mean a generation WAS attempted and failed its way out. */
+    const looksLikeParseError = err =>
+        /position|column|unknown command|unexpected/i.test(String(err?.message ?? err));
+
+    const executors = [];
+    if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
+        executors.push(text => ctx.executeSlashCommandsWithOptions(text, { handleParserErrors: false }));
     }
+    if (typeof ctx.executeSlashCommands === 'function') {
+        // deprecated form: (text, handleParserErrors, scope, handleExecutionErrors)
+        executors.push(text => ctx.executeSlashCommands(text, false));
+    }
+
+    for (const exec of executors) {
+        for (const text of ['regen', '/regen']) {
+            try {
+                await exec(text);
+                return true;
+            } catch (err) {
+                if (!looksLikeParseError(err)) {
+                    // command found but execution threw — treat as dispatched
+                    console.error('[TurboSkip] /regen execution error:', err);
+                    return true;
+                }
+                tsDebug(`slash form "${text}" rejected, trying next form`);
+            }
+        }
+    }
+
+    // Last resort: the Regenerate button's own click handler — same code path
+    // as pressing the option in the chat menu, works on every ST build.
+    const $regen = $('#option_regenerate');
+    if ($regen.length) {
+        tsDebug('falling back to #option_regenerate trigger');
+        $regen.trigger('click');
+        return true;
+    }
+
+    console.warn('[TurboSkip] no slash-command executor or regenerate button available');
+    toastr.error('TurboSkip: could not trigger a regeneration on this SillyTavern build — see console (F12).', '', { timeOut: 6000 });
+    return false;
 }
 
 // ── Event wiring ──────────────────────────────────────────────
 
-function onCharacterMessageRendered() {
+async function onCharacterMessageRendered() {
     if (suppressRender) return;
 
     // A render while a regen we dispatched is pending is that regen's result.
@@ -174,8 +210,12 @@ function onCharacterMessageRendered() {
         toastr.info(`TurboSkip: message missing required phrase — regenerating (${attempts}/${settings.maxAttempts})`, '', { timeOut: 2500 });
     }
 
-    awaitingSkip = true;
-    void dispatchRegen();
+    const dispatched = await dispatchRegen();
+    if (dispatched) {
+        awaitingSkip = true;
+    } else {
+        resetSkipState();
+    }
 }
 
 function onUserMessageRendered() {

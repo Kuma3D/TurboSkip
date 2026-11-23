@@ -14,7 +14,7 @@ Say you want the message to include "I love you" — if the generated message do
 
 ## How it works
 
-TurboSkip listens for `CHARACTER_MESSAGE_RENDERED`. When the latest AI message renders, it checks the message text against your phrase list. On failure it runs `/regen await=true` and re-checks the new text, looping up to the configured attempt limit.
+TurboSkip listens for `CHARACTER_MESSAGE_RENDERED`. When the latest AI message renders, it checks the message text against your phrase list. On failure it triggers a regeneration (via the `/regen` slash command — trying both `regen` and `/regen` textual forms since ST builds differ in whether the executor prepends its own slash, with the chat menu's Regenerate action as a final fallback) and re-checks when the regenerated message renders, looping up to the configured attempt limit.
 
 It only inspects the **last AI message**, and never regenerates after a user message arrives mid-loop (the loop aborts). Empty phrase list = no-op.
 
