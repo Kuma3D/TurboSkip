@@ -152,6 +152,33 @@ function waitForGenerationSettled(maxMs = 30000) {
 }
 
 /**
+ * Wait until SillyTavern's ENTIRE generation pipeline is idle — not just the
+ * generation TurboSkip dispatched, but any follow-up generation ST itself
+ * starts: auto-continue (triggerAutoContinue fires a 'continue' Generate
+ * synchronously inside our own pipeline's onSuccess), group-chat auto-mode
+ * member chains, etc. Those run concurrently with / after our awaited
+ * Generate resolves, and streamingProcessor is a shared module global — a
+ * regen dispatched while a follow-up is mid-stream races that global
+ * (one pipeline nulls it, the other calls .generate() on null → TypeError,
+ * and the message the follow-up was writing gets spliced out).
+ *
+ * Signal: document.body.dataset.generating — set by deactivateSendButtons()
+ * at generation start, cleared by activateSendButtons() at generation end —
+ * readable without script.js exports and true across the whole chain.
+ *
+ * @param {number} maxMs safety cap in ms
+ * @returns {Promise<void>}
+ */
+async function waitForPipelineIdle(maxMs = 30000) {
+    await waitForGenerationSettled(maxMs);
+    let waited = 0;
+    while (document.body.dataset.generating && waited < maxMs) {
+        await sleep(100);
+        waited += 100;
+    }
+}
+
+/**
  * Dispatch a regeneration by calling Generate('regenerate') directly — the
  * exact function the /regen slash command and the chat menu's Regenerate
  * option both invoke. Awaits the FULL generation pipeline before returning,
@@ -206,9 +233,11 @@ async function skipLoop() {
         if (getPhraseList().length === 0) return;
 
         for (let attempt = 1; attempt <= settings.maxAttempts; attempt++) {
-            // The render event that started this loop fired mid-generation:
-            // wait for that generation to fully end before touching anything.
-            await waitForGenerationSettled();
+            // The render event that started this loop fired mid-generation,
+            // and ST may start follow-up generations (auto-continue, group
+            // chains) after ours ends: wait until the whole pipeline is idle
+            // before dispatching anything.
+            await waitForPipelineIdle();
 
             const text = getLastMessageText();
             if (text === null) return;   // last message is no longer an AI message — abort
@@ -238,7 +267,7 @@ async function skipLoop() {
         }
 
         // All attempts used up — final verdict after the last generation settles.
-        await waitForGenerationSettled();
+        await waitForPipelineIdle();
         const text = getLastMessageText();
         if (text !== null && !passesCheck(text)) {
             tsDebug('gave up; message still does not satisfy phrase requirement');
