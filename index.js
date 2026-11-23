@@ -133,17 +133,19 @@ function waitForGenerationSettled(maxMs = 30000) {
 
     const { eventSource, eventTypes } = getContext();
     return new Promise(resolve => {
+        // ST's own code uses removeListener; off is unverified — use whichever
+        // exists, and never let cleanup throw before resolve() or the loop dies.
+        const off = typeof eventSource.off === 'function'
+            ? eventSource.off.bind(eventSource)
+            : (eventSource.removeListener ? eventSource.removeListener.bind(eventSource) : null);
         const onSettled = () => {
-            cleanup();
+            clearTimeout(timer);
             generationActive = false;
+            try { off?.(eventTypes.GENERATION_STOPPED, onSettled); } catch { /* ignore */ }
+            try { off?.(eventTypes.GENERATION_ENDED, onSettled); } catch { /* ignore */ }
             resolve();
         };
         const timer = setTimeout(onSettled, maxMs);
-        function cleanup() {
-            clearTimeout(timer);
-            eventSource.off(eventTypes.GENERATION_STOPPED, onSettled);
-            eventSource.off(eventTypes.GENERATION_ENDED, onSettled);
-        }
         eventSource.on(eventTypes.GENERATION_STOPPED, onSettled);
         eventSource.on(eventTypes.GENERATION_ENDED, onSettled);
     });
@@ -222,6 +224,17 @@ async function skipLoop() {
 
             const dispatched = await dispatchRegen();
             if (!dispatched) return;     // dispatch itself failed — stop
+
+            // Generate resolves undefined silently on some early guards
+            // (offline, interceptor abort, ...) — no generation ever ran, so
+            // no ENDED will fire and the next wait would stall pointlessly.
+            // Detect it via GENERATION_STARTED: set by onGenerationStarted
+            // while our dispatch was in flight.
+            if (!generationActive) {
+                tsDebug('dispatch resolved but no generation ever started — stopping');
+                toastr.warning('TurboSkip: regeneration did not start (generation was blocked) — stopping.', '', { timeOut: 5000 });
+                return;
+            }
         }
 
         // All attempts used up — final verdict after the last generation settles.
