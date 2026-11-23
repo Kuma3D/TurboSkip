@@ -7,13 +7,14 @@
  * invokes — and re-checks when that generation finishes, up to a max attempt
  * count.
  *
- * The loop is strictly serialized: it waits for any in-flight generation
- * (tracked via GENERATION_STARTED / GENERATION_STOPPED events) to fully end
- * before dispatching the next regen. CHARACTER_MESSAGE_RENDERED fires in the
- * middle of the generation pipeline, so dispatching a regen directly from
- * that handler would re-enter Generate while it is still running — which
- * splices the last message out and aborts the new generation, leaving the
- * chat with a deleted message and no reply.
+ * The loop is strictly serialized: before dispatching each regen it waits
+ * for SillyTavern's whole pipeline to be idle — dataset.generating cleared
+ * and the shared streamingProcessor module global null (sampled live via
+ * getContext()), with a brief sustained-quiet window for timer-chained
+ * follow-ups. CHARACTER_MESSAGE_RENDERED fires mid-pipeline, so dispatching
+ * from that handler directly would re-enter Generate while it still runs —
+ * splicing the last message out and aborting the new generation, leaving
+ * the chat with a deleted message and no reply.
  */
 
 const MODULE_NAME = 'turboSkip';
@@ -34,7 +35,6 @@ const DEFAULT_SETTINGS = {
 
 // ── State ────────────────────────────────────────────────────
 
-let generationActive = false; // a generation is currently in flight
 let skipLoopRunning = false;  // our serialized check-and-regen loop is active
 let suppressRender = false;   // ignore render events right after a chat switch
 
@@ -115,43 +115,6 @@ function getLastMessageText() {
 // ── The skip loop ──────────────────────────────────────────────
 
 /**
- * Wait until the current generation has fully settled.
- *
- * Event-driven: resolves the moment GENERATION_STOPPED **or** GENERATION_ENDED
- * fires (whichever comes first). STOPPED is the abort path; ENDED fires on
- * normal completion too — listening to both is what keeps this from stalling
- * on builds where STOPPED alone never fires after a completed generation.
- * The timeout is only a safety net (e.g. the extension loaded mid-generation
- * and missed the STARTED event, so generationActive is stale-true with no
- * event coming).
- *
- * @param {number} maxMs safety cap in ms
- * @returns {Promise<void>}
- */
-function waitForGenerationSettled(maxMs = 30000) {
-    if (!generationActive) return Promise.resolve();
-
-    const { eventSource, eventTypes } = getContext();
-    return new Promise(resolve => {
-        // ST's own code uses removeListener; off is unverified — use whichever
-        // exists, and never let cleanup throw before resolve() or the loop dies.
-        const off = typeof eventSource.off === 'function'
-            ? eventSource.off.bind(eventSource)
-            : (eventSource.removeListener ? eventSource.removeListener.bind(eventSource) : null);
-        const onSettled = () => {
-            clearTimeout(timer);
-            generationActive = false;
-            try { off?.(eventTypes.GENERATION_STOPPED, onSettled); } catch { /* ignore */ }
-            try { off?.(eventTypes.GENERATION_ENDED, onSettled); } catch { /* ignore */ }
-            resolve();
-        };
-        const timer = setTimeout(onSettled, maxMs);
-        eventSource.on(eventTypes.GENERATION_STOPPED, onSettled);
-        eventSource.on(eventTypes.GENERATION_ENDED, onSettled);
-    });
-}
-
-/**
  * Wait until SillyTavern's ENTIRE generation pipeline is idle — not just the
  * generation TurboSkip dispatched, but any follow-up generation ST itself
  * starts: auto-continue (triggerAutoContinue fires a 'continue' Generate
@@ -162,21 +125,17 @@ function waitForGenerationSettled(maxMs = 30000) {
  * nulls it, the other calls .generate() on null → TypeError, and the
  * message gets spliced out).
  *
- * Three busy signals, any one of which means NOT idle:
- *  - generationActive      — GENERATION_STARTED fired, no STOPPED/ENDED yet
- *                            (fires at the very top of Generate, before
- *                            prompt building: catches follow-ups earliest)
- *  - document.body.dataset.generating — set by deactivateSendButtons(),
- *                            cleared by activateSendButtons()
- *  - ctx.streamingProcessor !== null — the module global itself, read live
- *                            via getContext(); non-null while a stream runs
- *                            or a pipeline tail has not yet nulled it.
+ * Busy signals, any one of which means NOT idle:
+ *  - document.body.dataset.generating — set by deactivateSendButtons()
+ *                            (skipped for quiet/dry gens), cleared by
+ *                            activateSendButtons()
+ *  - ctx.streamingProcessor !== null — the module global itself, sampled
+ *                            fresh per poll via getContext(); non-null while
+ *                            a stream runs or a pipeline tail hasn't nulled it
  *
- * Requires sustained quiet (quietMs): a follow-up generation announces
- * itself via GENERATION_STARTED at the very top of Generate() — awaited,
- * so synchronous follow-ups (auto-continue's click) trip generationActive
- * before our own dispatch even resolves. Only timer-based starts (group
- * auto-mode) need the window; keep it short.
+ * Requires sustained quiet (quietMs): timer-based follow-up starts (ST
+ * features that chain generations) need a brief all-clear window before
+ * a dispatch is safe; keep it short.
  *
  * Note: remaining inter-regen delay beyond this window is ST itself
  * generating a follow-up (auto-continue / auto-swipe / group chain) —
@@ -188,16 +147,23 @@ function waitForGenerationSettled(maxMs = 30000) {
  * @returns {Promise<void>}
  */
 async function waitForPipelineIdle(maxMs = 30000, quietMs = 500) {
-    await waitForGenerationSettled(maxMs);
-
     // NB: getContext() copies streamingProcessor's CURRENT value into the
     // returned object — it is a snapshot, not a live binding. Must call
     // getContext() on EVERY poll, or a mid-pipeline sample sticks truthy
     // forever and the wait burns to its cap.
+    //
+    // Deliberately NOT waiting on the GENERATION_STARTED/ENDED event flags:
+    // quiet/background generations fire STARTED but never run hideStopButton,
+    // so ENDED never fires and generationActive sticks true until its 30s cap —
+    // that WAS the 10s lag. Instead:
+    //  - dataset.generating — set by deactivateSendButtons (skipped for
+    //    quiet/dry gens), cleared by activateSendButtons; true for the whole
+    //    real-generation span, both streaming and non-streaming modes
+    //  - streamingProcessor — the module global itself, live-sampled; non-null
+    //    while a stream runs or a pipeline tail hasn't nulled it yet
     const isBusy = () => {
         const ctx = getContext();
-        return generationActive
-            || !!document.body.dataset.generating
+        return !!document.body.dataset.generating
             || ctx.streamingProcessor != null;
     };
 
@@ -243,9 +209,9 @@ async function dispatchRegen() {
         }
     }
 
-    // Fallback: the chat options menu's Regenerate option handler.
-    // Its pipeline is not awaitable, so rely on generationActive tracking +
-    // waitUntilGenerationIdle() before the next loop iteration.
+    // Fallback: the chat options menu's Regenerate option handler. Its
+    // pipeline is not awaitable, so the next loop iteration's
+    // waitForPipelineIdle() poll covers it.
     const $regen = $('#option_regenerate');
     if ($regen.length) {
         tsDebug('falling back to #option_regenerate trigger');
@@ -293,17 +259,6 @@ async function skipLoop() {
 
             const dispatched = await dispatchRegen();
             if (!dispatched) return;     // dispatch itself failed — stop
-
-            // Generate resolves undefined silently on some early guards
-            // (offline, interceptor abort, ...) — no generation ever ran, so
-            // no ENDED will fire and the next wait would stall pointlessly.
-            // Detect it via GENERATION_STARTED: set by onGenerationStarted
-            // while our dispatch was in flight.
-            if (!generationActive) {
-                tsDebug('dispatch resolved but no generation ever started — stopping');
-                toastr.warning('TurboSkip: regeneration did not start (generation was blocked) — stopping.', '', { timeOut: 5000 });
-                return;
-            }
         }
 
         // All attempts used up — final verdict after the last generation settles.
@@ -325,17 +280,6 @@ async function skipLoop() {
 function onCharacterMessageRendered() {
     if (suppressRender) return;
     void skipLoop();
-}
-
-function onGenerationStarted() {
-    generationActive = true;
-}
-
-// Both end-events mean the generation is over: STOPPED is the abort path,
-// ENDED fires on normal completion too. Clearing on both keeps the flag
-// accurate so waitForGenerationSettled never waits on a stale-true flag.
-function onGenerationStopped() {
-    generationActive = false;
 }
 
 function onUserMessageRendered() {
@@ -453,9 +397,6 @@ async function init() {
     eventSource.on(eventTypes.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
     eventSource.on(eventTypes.USER_MESSAGE_RENDERED, onUserMessageRendered);
     eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
-    eventSource.on(eventTypes.GENERATION_STARTED, onGenerationStarted);
-    eventSource.on(eventTypes.GENERATION_STOPPED, onGenerationStopped);
-    eventSource.on(eventTypes.GENERATION_ENDED, onGenerationStopped);
 
     initSettingsPanel();
     tsDebug('initialized');
