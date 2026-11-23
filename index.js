@@ -115,15 +115,38 @@ function getLastMessageText() {
 // ── The skip loop ──────────────────────────────────────────────
 
 /**
- * Wait until no generation is in flight (max ~60s, then proceed regardless —
- * in case a STOPPED event was missed, e.g. the extension loaded mid-generation).
+ * Wait until the current generation has fully settled.
+ *
+ * Event-driven: resolves the moment GENERATION_STOPPED **or** GENERATION_ENDED
+ * fires (whichever comes first). STOPPED is the abort path; ENDED fires on
+ * normal completion too — listening to both is what keeps this from stalling
+ * on builds where STOPPED alone never fires after a completed generation.
+ * The timeout is only a safety net (e.g. the extension loaded mid-generation
+ * and missed the STARTED event, so generationActive is stale-true with no
+ * event coming).
+ *
+ * @param {number} maxMs safety cap in ms
+ * @returns {Promise<void>}
  */
-async function waitUntilGenerationIdle() {
-    let waited = 0;
-    while (generationActive && waited < 60000) {
-        await sleep(100);
-        waited += 100;
-    }
+function waitForGenerationSettled(maxMs = 30000) {
+    if (!generationActive) return Promise.resolve();
+
+    const { eventSource, eventTypes } = getContext();
+    return new Promise(resolve => {
+        const onSettled = () => {
+            cleanup();
+            generationActive = false;
+            resolve();
+        };
+        const timer = setTimeout(onSettled, maxMs);
+        function cleanup() {
+            clearTimeout(timer);
+            eventSource.off(eventTypes.GENERATION_STOPPED, onSettled);
+            eventSource.off(eventTypes.GENERATION_ENDED, onSettled);
+        }
+        eventSource.on(eventTypes.GENERATION_STOPPED, onSettled);
+        eventSource.on(eventTypes.GENERATION_ENDED, onSettled);
+    });
 }
 
 /**
@@ -183,7 +206,7 @@ async function skipLoop() {
         for (let attempt = 1; attempt <= settings.maxAttempts; attempt++) {
             // The render event that started this loop fired mid-generation:
             // wait for that generation to fully end before touching anything.
-            await waitUntilGenerationIdle();
+            await waitForGenerationSettled();
 
             const text = getLastMessageText();
             if (text === null) return;   // last message is no longer an AI message — abort
@@ -201,8 +224,8 @@ async function skipLoop() {
             if (!dispatched) return;     // dispatch itself failed — stop
         }
 
-        // All attempts used up — final verdict after the last generation ends.
-        await waitUntilGenerationIdle();
+        // All attempts used up — final verdict after the last generation settles.
+        await waitForGenerationSettled();
         const text = getLastMessageText();
         if (text !== null && !passesCheck(text)) {
             tsDebug('gave up; message still does not satisfy phrase requirement');
@@ -226,6 +249,9 @@ function onGenerationStarted() {
     generationActive = true;
 }
 
+// Both end-events mean the generation is over: STOPPED is the abort path,
+// ENDED fires on normal completion too. Clearing on both keeps the flag
+// accurate so waitForGenerationSettled never waits on a stale-true flag.
 function onGenerationStopped() {
     generationActive = false;
 }
@@ -347,6 +373,7 @@ async function init() {
     eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
     eventSource.on(eventTypes.GENERATION_STARTED, onGenerationStarted);
     eventSource.on(eventTypes.GENERATION_STOPPED, onGenerationStopped);
+    eventSource.on(eventTypes.GENERATION_ENDED, onGenerationStopped);
 
     initSettingsPanel();
     tsDebug('initialized');
